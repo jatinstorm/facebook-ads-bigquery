@@ -1,0 +1,7 @@
+functions-framework==3.*
+requests>=2.31,<3
+google-auth>=2.20,<3
+google-cloud-bigquery
+python-dotenv
+flask
+gunicorn
