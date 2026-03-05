@@ -169,7 +169,6 @@ def insert_bigquery(rows):
 SHEET_COLUMNS = [
     "adset_name",
     "date_start",
-    "date_stop",
     "inline_link_clicks",
     "reach",
     "frequency",
@@ -189,19 +188,19 @@ SHEET_COLUMNS = [
 ]
 
 
-from google.auth import default
-
 def _get_sheets_service():
-    credentials, _ = default(scopes=[
-        "https://www.googleapis.com/auth/spreadsheets"
-    ])
+    """Build a Google Sheets API service using the service-account JSON
+    key file pointed to by GOOGLE_SERVICE_ACCOUNT_FILE."""
+    if not GOOGLE_SERVICE_ACCOUNT_FILE:
+        raise RuntimeError(
+            "GOOGLE_SERVICE_ACCOUNT_FILE not set — cannot write to Sheets"
+        )
 
-    return build(
-        "sheets",
-        "v4",
-        credentials=credentials,
-        cache_discovery=False
+    creds = service_account.Credentials.from_service_account_file(
+        GOOGLE_SERVICE_ACCOUNT_FILE,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
     )
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
 def insert_google_sheets(rows):
