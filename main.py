@@ -1,10 +1,10 @@
 """
-Facebook Ads → BigQuery Importer
-Fetches ad insights from Facebook Marketing API and inserts them into BigQuery.
+Facebook Ads → BigQuery + Google Sheets Importer
+Fetches ad insights from Facebook Marketing API and inserts them into
+both BigQuery and a Google Sheet.
 """
 
 from flask import Flask, request
-
 
 import os
 import json
@@ -14,13 +14,14 @@ from urllib.parse import urlencode
 import requests
 from dotenv import load_dotenv
 from google.cloud import bigquery
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 # -------------------------------------------------------------------
 # Load environment variables
 # -------------------------------------------------------------------
 
 app = Flask(__name__)
-
 
 load_dotenv()
 
@@ -31,6 +32,14 @@ GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v24.0")
 BQ_PROJECT_ID = os.getenv("BQ_PROJECT_ID")
 BQ_DATASET = os.getenv("BQ_DATASET")
 BQ_TABLE = os.getenv("BQ_TABLE")
+
+# Google Sheets config
+GOOGLE_SHEETS_SPREADSHEET_ID = os.getenv(
+    "GOOGLE_SHEETS_SPREADSHEET_ID",
+    "1EgeGbvBapXa6g4WXGth79fR1w0RWE8WWZ1gQjKhl9fQ",
+)
+GOOGLE_SHEETS_SHEET_NAME = os.getenv("GOOGLE_SHEETS_SHEET_NAME", "FB Ads")
+GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
 
 BASE_API_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{FB_AD_ACCOUNT_ID}/insights?"
 
@@ -152,6 +161,80 @@ def insert_bigquery(rows):
 
 
 # -------------------------------------------------------------------
+# Google Sheets
+# -------------------------------------------------------------------
+
+# Column order matches the Apps Script so the split columns (N–S)
+# line up correctly in the sheet.
+SHEET_COLUMNS = [
+    "adset_name",
+    "date_start",
+    "date_stop",
+    "inline_link_clicks",
+    "reach",
+    "frequency",
+    "cost_per_inline_link_click",
+    "spend",
+    "impressions",
+    "inline_link_click_ctr",
+    "clicks",
+    "ctr",
+    "cpc",
+    "Edition_ID",
+    "Buy_Pre_order",
+    "Territory",
+    "Targeting_type",
+    "Targeting",
+    "Age_range",
+]
+
+
+from google.auth import default
+
+def _get_sheets_service():
+    credentials, _ = default(scopes=[
+        "https://www.googleapis.com/auth/spreadsheets"
+    ])
+
+    return build(
+        "sheets",
+        "v4",
+        credentials=credentials,
+        cache_discovery=False
+    )
+
+
+def insert_google_sheets(rows):
+    """Append rows to the configured Google Sheet, mirroring the
+    behaviour of the original Apps Script (data + split columns)."""
+    service = _get_sheets_service()
+
+    # Convert list-of-dicts → list-of-lists in the right column order
+    values = []
+    for row in rows:
+        values.append([row.get(col, "") for col in SHEET_COLUMNS])
+
+    body = {"values": values}
+
+    result = (
+        service.spreadsheets()
+        .values()
+        .append(
+            spreadsheetId=GOOGLE_SHEETS_SPREADSHEET_ID,
+            range=f"{GOOGLE_SHEETS_SHEET_NAME}!A:S",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body,
+        )
+        .execute()
+    )
+
+    updated = result.get("updates", {}).get("updatedRows", 0)
+    logger.info("Appended %d rows to Google Sheets", updated)
+    return updated
+
+
+# -------------------------------------------------------------------
 # Cloud Function Entry
 # -------------------------------------------------------------------
 
@@ -168,9 +251,23 @@ def import_facebook_ads(request=None):
 
         rows = transform_rows(raw_data)
 
-        count = insert_bigquery(rows)
+        # --- BigQuery ---
+        bq_count = insert_bigquery(rows)
 
-        return (f"Success — {count} rows inserted", 200)
+        # --- Google Sheets ---
+        try:
+            sheets_count = insert_google_sheets(rows)
+        except Exception as sheets_err:
+            logger.exception("Google Sheets insert failed")
+            return (
+                f"BigQuery OK ({bq_count} rows) but Sheets failed: {sheets_err}",
+                207,
+            )
+
+        return (
+            f"Success — {bq_count} rows → BigQuery, {sheets_count} rows → Sheets",
+            200,
+        )
 
     except Exception as e:
         logger.exception("Import failed")
@@ -181,7 +278,8 @@ def import_facebook_ads(request=None):
 # Local testing
 # -------------------------------------------------------------------
 
-@app.route("/", methods=["GET","POST"])
+
+@app.route("/", methods=["GET", "POST"])
 def run_import():
     message, status = import_facebook_ads(request)
     return message, status
