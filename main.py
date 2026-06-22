@@ -59,7 +59,8 @@ def build_api_url():
             "frequency,cost_per_inline_link_click,spend,impressions,"
             "inline_link_click_ctr,clicks,ctr,cpc"
         ),
-        "date_preset": "yesterday",
+        "time_range": json.dumps({"since": "2026-06-19", "until": "2026-06-20"}),
+        "time_increment": 1,
         "access_token": FB_ACCESS_TOKEN,
     }
 
