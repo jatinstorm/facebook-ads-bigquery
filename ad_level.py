@@ -139,17 +139,47 @@ def get_access_token():
     return os.getenv("FB_ENGLISH_ACCESS_TOKEN")
 
 
-def graph_get(url, params=None, max_retries=6):
-    """GET with back-off on Meta's rate-limit errors."""
+def usage(response):
+    """Meta's per-account usage header: (highest % used, minutes until access returns)."""
+    try:
+        buckets = json.loads(response.headers.get("x-business-use-case-usage") or "{}")
+    except ValueError:
+        return 0, 0
+
+    pct, regain = 0, 0
+    for entries in buckets.values():
+        for e in entries:
+            pct = max(pct, e.get("call_count", 0), e.get("total_cputime", 0), e.get("total_time", 0))
+            regain = max(regain, e.get("estimated_time_to_regain_access", 0))
+    return pct, regain
+
+
+def graph_get(url, params=None, max_retries=8):
+    """GET that respects Meta's rate limits: waits as long as Meta says when
+    throttled, and slows down before the limit when usage gets high."""
     for attempt in range(max_retries):
-        payload = requests.get(url, params=params, timeout=120).json()
+        try:
+            response = requests.get(url, params=params, timeout=120)
+            payload = response.json()
+        except (requests.RequestException, ValueError) as e:
+            # Dropped connections and timeouts: wait and try again
+            if attempt == max_retries - 1:
+                raise RuntimeError(f"Graph API request failed: {type(e).__name__}") from None
+            logger.warning("Network error (%s), retrying in 30s", type(e).__name__)
+            time.sleep(30)
+            continue
+
         error = payload.get("error")
+        pct, regain = usage(response)
 
         if not error:
+            if pct >= 75:
+                logger.info("Ad account usage at %d%%, pausing 2 min", pct)
+                time.sleep(120)
             return payload
 
         if error.get("code") in RATE_LIMIT_CODES and attempt < max_retries - 1:
-            wait = 60 * (2 ** attempt)
+            wait = max(regain * 60 + 30, 60 * min(2 ** attempt, 16))
             logger.warning("Rate limited (%s), waiting %ds", error.get("code"), wait)
             time.sleep(wait)
             continue
@@ -192,13 +222,13 @@ def fetch_ad_insights(account_id, since, until):
     )
 
 
-def fetch_ads(ad_ids, pause=0):
+def fetch_ads(ad_ids, pause=0, batch_size=CREATIVE_BATCH):
     """Ads with their creative expanded, fetched by ID in batches. Works for
     paused, archived and deleted ads, unlike listing /ads."""
     ads = []
 
-    for i in range(0, len(ad_ids), CREATIVE_BATCH):
-        batch = ad_ids[i : i + CREATIVE_BATCH]
+    for i in range(0, len(ad_ids), batch_size):
+        batch = ad_ids[i : i + batch_size]
         payload = graph_get(
             f"{GRAPH_URL}/",
             {"ids": ",".join(batch), "fields": AD_FIELDS, "access_token": get_access_token()},
@@ -476,19 +506,25 @@ def import_ad_insights(since=None, until=None, chunk_days=CHUNK_DAYS, pause=0):
     return results
 
 
-def import_creatives(since, until, pause=0):
+def import_creatives(since, until, pause=0, batch_size=CREATIVE_BATCH, only_missing=False,
+                     save_every=500):
     """Refresh the creative row of every ad that ran in the date range, so new
-    ads appear and renamed or edited ones are updated."""
+    ads appear and renamed or edited ones are updated. Saves as it goes; with
+    only_missing a re-run picks up where an interrupted one stopped."""
     if not get_access_token():
         raise RuntimeError("Facebook token missing (secret fb-english-token)")
 
     client = bigquery.Client(project=BQ_PROJECT_ID)
     ensure_tables(client)
 
+    missing_filter = (
+        f"AND ad_id NOT IN (SELECT ad_id FROM `{CREATIVES_TABLE}`)" if only_missing else ""
+    )
     ad_ids = [
         row.ad_id
         for row in client.query(
-            f"SELECT DISTINCT ad_id FROM `{INSIGHTS_TABLE}` WHERE date BETWEEN @since AND @until",
+            f"SELECT DISTINCT ad_id FROM `{INSIGHTS_TABLE}` "
+            f"WHERE date BETWEEN @since AND @until {missing_filter} ORDER BY ad_id",
             job_config=bigquery.QueryJobConfig(
                 query_parameters=[
                     bigquery.ScalarQueryParameter("since", "DATE", since),
@@ -498,9 +534,12 @@ def import_creatives(since, until, pause=0):
         ).result()
     ]
 
-    rows = transform_creatives(fetch_ads(ad_ids, pause))
-    count = replace_creatives(client, rows)
-    logger.info("Creatives: %d of %d ads refreshed (%s to %s)", count, len(ad_ids), since, until)
+    count = 0
+    for i in range(0, len(ad_ids), save_every):
+        chunk = ad_ids[i : i + save_every]
+        count += replace_creatives(client, transform_creatives(fetch_ads(chunk, pause, batch_size)))
+        logger.info("Creatives: %d of %d ads saved (%s to %s)", count, len(ad_ids), since, until)
+
     return count
 
 
@@ -534,4 +573,4 @@ if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "backfill":
         _, _, since, until = sys.argv
         print(import_ad_insights(since, until, chunk_days=14, pause=20))
-        print({"creatives": import_creatives(since, until, pause=10)})
+        print({"creatives": import_creatives(since, until, pause=10, batch_size=25, only_missing=True)})
