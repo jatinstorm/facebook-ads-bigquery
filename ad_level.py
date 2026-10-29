@@ -192,7 +192,7 @@ def fetch_ad_insights(account_id, since, until):
     )
 
 
-def fetch_ads(ad_ids):
+def fetch_ads(ad_ids, pause=0):
     """Ads with their creative expanded, fetched by ID in batches. Works for
     paused, archived and deleted ads, unlike listing /ads."""
     ads = []
@@ -204,6 +204,7 @@ def fetch_ads(ad_ids):
             {"ids": ",".join(batch), "fields": AD_FIELDS, "access_token": get_access_token()},
         )
         ads.extend(payload.values())
+        time.sleep(pause)
 
     return ads
 
@@ -447,7 +448,7 @@ def date_chunks(since, until, days=CHUNK_DAYS):
         start = chunk_end + timedelta(days=1)
 
 
-def import_ad_insights(since=None, until=None):
+def import_ad_insights(since=None, until=None, chunk_days=CHUNK_DAYS, pause=0):
     if not get_access_token():
         raise RuntimeError("Facebook token missing (secret fb-english-token)")
 
@@ -463,18 +464,19 @@ def import_ad_insights(since=None, until=None):
         account = get_account(account_id)
         total = 0
 
-        for chunk_since, chunk_until in date_chunks(since, until):
+        for chunk_since, chunk_until in date_chunks(since, until, chunk_days):
             raw = fetch_ad_insights(account_id, chunk_since, chunk_until)
             rows = transform_rows(raw, account_id, account)
             total += replace_range(client, account_id, rows, chunk_since, chunk_until)
             logger.info("%s: %d ad rows (%s to %s)", account_id, len(rows), chunk_since, chunk_until)
+            time.sleep(pause)
 
         results[account_id] = total
 
     return results
 
 
-def import_creatives(since, until):
+def import_creatives(since, until, pause=0):
     """Refresh the creative row of every ad that ran in the date range, so new
     ads appear and renamed or edited ones are updated."""
     if not get_access_token():
@@ -496,7 +498,7 @@ def import_creatives(since, until):
         ).result()
     ]
 
-    rows = transform_creatives(fetch_ads(ad_ids))
+    rows = transform_creatives(fetch_ads(ad_ids, pause))
     count = replace_creatives(client, rows)
     logger.info("Creatives: %d of %d ads refreshed (%s to %s)", count, len(ad_ids), since, until)
     return count
@@ -518,3 +520,18 @@ def run_import():
     except Exception as e:
         logger.exception("Import failed")
         return (str(e), 500)
+
+
+# -------------------------------------------------------------------
+# One-off back-fill:  python ad_level.py backfill 2023-10-01 2026-09-25
+# Oldest first, paced to stay under Meta's limits on the shared ad account.
+# Safe to re-run: every chunk replaces its own dates.
+# -------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) == 4 and sys.argv[1] == "backfill":
+        _, _, since, until = sys.argv
+        print(import_ad_insights(since, until, chunk_days=14, pause=20))
+        print({"creatives": import_creatives(since, until, pause=10)})
